@@ -74,6 +74,11 @@ pip install git+https://github.com/chengjiaxiao/openpyxl-365.git
 开源工具，可以让更多使用 Python 自动化 Excel 的开发者少踩一些坑，也欢迎
 社区贡献新的样本、边界条件和跨版本验证结果。
 
+## 作者
+
+- 程加骁：项目发起与维护
+- GPT（OpenAI）：协作实现与文档整理
+
 ## 许可证
 
 MIT。本项目为独立社区项目，与 `openpyxl` 项目及 Microsoft 无隶属或背书关系。

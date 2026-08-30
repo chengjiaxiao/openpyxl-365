@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openpyxl-365"
-version = "0.1.0"
+version = "0.1.1"
 description = "A preservation layer for editing modern Excel 365 workbooks with openpyxl"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
   { name = "Cheng Jiaxiao" },
+  { name = "GPT (OpenAI)" },
 ]
 keywords = [
   "excel",

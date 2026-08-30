@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.1 - 2026-08-30
+
+- Add GPT (OpenAI) as a collaborative author in package metadata and project
+  documentation.
+
 ## 0.1.0 - 2026-08-30
 
 Initial open-source release.

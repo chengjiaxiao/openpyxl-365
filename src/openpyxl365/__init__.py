@@ -14,4 +14,4 @@ __all__ = [
     "normalize_excel365_formula",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

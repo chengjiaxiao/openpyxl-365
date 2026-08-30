@@ -128,6 +128,11 @@ features survive an `openpyxl` edit/save round trip. Reproducible fixtures,
 OOXML edge cases, and compatibility reports from different Excel versions are
 especially welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Authors
+
+- Cheng Jiaxiao — creator and maintainer
+- GPT (OpenAI) — collaborative implementation and documentation
+
 ## License
 
 MIT. This project is independent and is not affiliated with the `openpyxl`
