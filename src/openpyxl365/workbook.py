@@ -14,24 +14,32 @@ Excel and recalculate it before treating cached values as current.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
+import shutil
+import sys
 import tempfile
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.reader.strings import read_string_table
+from openpyxl.cell.rich_text import CellRichText
 from openpyxl.formula import Tokenizer
 from openpyxl.formula.tokenizer import Token
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.packaging.relationship import Relationship
+from openpyxl.workbook.properties import CalcProperties
+from openpyxl.workbook.external_link.external import (
+    ExternalLink, ExternalBook, ExternalSheetNames,
+)
 from openpyxl.xml.functions import SubElement, fromstring, tostring
 
-from openpyxl365.ooxml_data_validations import (
-    discover_extended_data_validations,
-    restore_extended_data_validations,
-)
 from openpyxl365.ooxml_drawings import (
     discover_drawing_state,
     patch_preserved_content_types,
@@ -39,11 +47,16 @@ from openpyxl365.ooxml_drawings import (
     restore_drawing_relationship,
     restore_worksheet_drawing,
 )
+from openpyxl365.ooxml_data_validations import (
+    discover_extended_data_validations,
+    restore_extended_data_validations,
+)
 from openpyxl365.ooxml_threaded_comments import (
     discover_threaded_comment_state,
     restore_threaded_comment_relationships,
     restore_threaded_comment_worksheet,
 )
+
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 DOCUMENT_REL_NS = (
@@ -57,6 +70,7 @@ SHEET_METADATA_CONTENT_TYPE = (
     "sheetMetadata+xml"
 )
 RICH_DATA_PART_PREFIX = "xl/richData/"
+PYTHON_REL = "http://schemas.microsoft.com/office/2023/09/relationships/Python"
 
 _DYNAMIC_FUNCTIONS = {
     "ANCHORARRAY",
@@ -213,6 +227,31 @@ def normalize_excel365_formula(formula: str) -> tuple[str, set[str]]:
     return "".join(pieces), functions
 
 
+CALCULATION_ATTRIBUTES = (
+    "calcId", "calcMode", "fullCalcOnLoad", "refMode", "iterate", "iterateCount",
+    "iterateDelta", "fullPrecision", "calcCompleted", "calcOnSave",
+    "concurrentCalc", "concurrentManualCount", "forceFullCalc",
+)
+
+
+def _sync_calculation_properties(path: Path, workbook: Workbook) -> None:
+    """Report only calculation attributes actually present in the source file."""
+
+    try:
+        with ZipFile(path) as archive:
+            root = fromstring(archive.read("xl/workbook.xml"))
+    except KeyError:
+        return
+    element = root.find(f"{{{MAIN_NS}}}calcPr")
+    present = set(element.attrib) if element is not None else set()
+    calculation = workbook.calculation
+    if calculation is None:
+        return
+    for name in CALCULATION_ATTRIBUTES:
+        if name not in present and hasattr(calculation, name):
+            setattr(calculation, name, None)
+
+
 def _normalise_package_target(target: str) -> str:
     if target.startswith("/"):
         return target.lstrip("/")
@@ -320,7 +359,7 @@ def _discover_package_state(path: Path) -> dict[str, Any]:
 
     with ZipFile(path) as archive:
         # openpyxl parses external links but rewrites their cached sheet data.
-        # Some real-world XLA add-in links are then rejected by Excel.
+        # Some real-world XLA links (notably iFinD) are then rejected by Excel.
         # Formula editing does not require touching these parts, so keep them
         # byte-for-byte from the source package.
         preserved_package_parts = {
@@ -340,6 +379,11 @@ def _discover_package_state(path: Path) -> dict[str, Any]:
         preserved_package_parts.update(
             threaded_comment_state["package_parts"]
         )
+        shared_strings = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            shared_strings = read_string_table(
+                BytesIO(archive.read("xl/sharedStrings.xml"))
+            )
         rich_data_parts = {
             name
             for name in archive.namelist()
@@ -351,14 +395,29 @@ def _discover_package_state(path: Path) -> dict[str, Any]:
         workbook_relationships = fromstring(
             archive.read("xl/_rels/workbook.xml.rels")
         )
+        # PY() references code/environment definitions outside the worksheet.
+        # Preserve that payload and its relationship alongside Rich Data.
+        python_parts = set()
+        for relationship in workbook_relationships:
+            if (
+                relationship.get("Type") == PYTHON_REL
+                and relationship.get("TargetMode") != "External"
+            ):
+                target = _normalise_package_target(relationship.get("Target", ""))
+                if target in archive.namelist():
+                    python_parts.add(target)
+        preserved_package_parts.update(
+            {name: archive.read(name) for name in python_parts}
+        )
         preserved_workbook_relationships: list[dict[str, str]] = []
         for relationship in workbook_relationships:
             target = relationship.get("Target")
             if (
                 not target
                 or relationship.get("TargetMode") == "External"
-                or not _normalise_package_target(target).startswith(
-                    RICH_DATA_PART_PREFIX
+                or not (
+                    _normalise_package_target(target).startswith(RICH_DATA_PART_PREFIX)
+                    or _normalise_package_target(target) in python_parts
                 )
             ):
                 continue
@@ -367,7 +426,7 @@ def _discover_package_state(path: Path) -> dict[str, Any]:
             threaded_comment_state["workbook_relationships"]
         )
         rich_data_content_types = _discover_content_types_for_parts(
-            archive, rich_data_parts
+            archive, rich_data_parts | python_parts
         )
         metadata_xml = (
             archive.read("xl/metadata.xml")
@@ -413,6 +472,13 @@ def _discover_package_state(path: Path) -> dict[str, Any]:
                         cached_value.text if cached_value is not None else None
                     ),
                 }
+                snapshot = sheet_formula_attributes[coordinate]
+                # openpyxl writes inline strings and drops sharedStrings.xml.
+                # A restored formula cache must contain text, not an orphaned
+                # index into the source workbook's string table.
+                if cell.get("t") == "s" and cached_value is not None:
+                    snapshot["cached_value"] = shared_strings[int(cached_value.text)]
+                    snapshot["cell_type"] = "str"
                 if cell.get("cm") in dynamic_indices:
                     sheet_dynamic.add(coordinate)
 
@@ -562,6 +628,12 @@ def _patch_worksheet(
     drawing_relationship_id: str | None,
 ) -> bytes:
     root = fromstring(xml)
+    # Rich-text runs containing spaces require xml:space. openpyxl omits it
+    # on some runs, and Excel repairs those strings by stripping the spaces.
+    for text_node in root.findall(f".//{{{MAIN_NS}}}is//{{{MAIN_NS}}}t"):
+        text = text_node.text
+        if text and text != text.strip():
+            text_node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
     cells = {
         cell.get("r"): cell
         for cell in root.findall(f".//{{{MAIN_NS}}}c")
@@ -572,7 +644,45 @@ def _patch_worksheet(
         if cell is None:
             continue
         for name, value in attributes.items():
+            formula = cell.find(f"{{{MAIN_NS}}}f")
+            snapshot = preserved_formula_attributes.get(coordinate)
+            if snapshot is not None:
+                no_array = formula is None or (
+                    formula.get("t") != "array" and coordinate not in dynamic_coordinates
+                )
+                changed_formula = formula is None or (formula.text or "") != snapshot.get(
+                    "loaded_text", snapshot["text"]
+                )
+                if (name == "cm" and no_array) or (name == "vm" and changed_formula):
+                    # Neither the array marker nor its old rich/error value
+                    # metadata belongs on a replacement scalar/formula.
+                    cell.attrib.pop(name, None)
+                    continue
             cell.set(name, value)
+
+    # A shared formula is one OOXML group: one master carries the formula and
+    # range, while followers carry only the shared index. If any member was
+    # edited, restoring the remaining members independently can leave an
+    # orphaned group (followers without a master). In that case keep
+    # openpyxl's expanded ordinary formulas for the whole group instead.
+    shared_groups: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for coordinate, snapshot in preserved_formula_attributes.items():
+        attributes = snapshot.get("attributes", {})
+        if attributes.get("t") == "shared" and attributes.get("si") is not None:
+            shared_groups.setdefault(attributes["si"], []).append(
+                (coordinate, snapshot)
+            )
+    restorable_shared_groups = {
+        shared_index
+        for shared_index, members in shared_groups.items()
+        if all(
+            (cell := cells.get(coordinate)) is not None
+            and (formula := cell.find(f"{{{MAIN_NS}}}f")) is not None
+            and (formula.text or "")
+            == snapshot.get("loaded_text", snapshot["text"])
+            for coordinate, snapshot in members
+        )
+    }
 
     # openpyxl retains array formula text/ref but drops optional attributes
     # such as aca/ca.  Restore them only when the formula itself is unchanged.
@@ -581,10 +691,19 @@ def _patch_worksheet(
         if cell is None:
             continue
         formula = cell.find(f"{{{MAIN_NS}}}f")
-        if formula is None or (formula.text or "") != snapshot["text"]:
+        expected_text = snapshot.get("loaded_text", snapshot["text"])
+        if formula is None or (formula.text or "") != expected_text:
             continue
-        formula.attrib.clear()
-        formula.attrib.update(snapshot["attributes"])
+        source_attributes = snapshot["attributes"]
+        shared_index = (
+            source_attributes.get("si")
+            if source_attributes.get("t") == "shared"
+            else None
+        )
+        if shared_index is None or shared_index in restorable_shared_groups:
+            formula.attrib.clear()
+            formula.attrib.update(source_attributes)
+            formula.text = snapshot["text"] or None
         if coordinate in invalidated_formula_caches:
             continue
 
@@ -612,6 +731,20 @@ def _patch_worksheet(
         cell.set("cm", dynamic_metadata_index)
         formula.set("t", "array")
         formula.set("ref", coordinate)
+    shared = [
+        formula
+        for cell in cells.values()
+        if (formula := cell.find(f"{{{MAIN_NS}}}f")) is not None
+        and formula.get("t") == "shared"
+    ]
+    shared_indices = {formula.get("si") for formula in shared}
+    shared_masters = {
+        formula.get("si")
+        for formula in shared
+        if formula.get("ref") and (formula.text or "").strip()
+    }
+    if orphaned := sorted(shared_indices - shared_masters):
+        raise RuntimeError(f"Worksheet contains orphaned shared-formula groups: {orphaned}")
     if drawing_relationship_id is not None:
         restore_worksheet_drawing(root, drawing_relationship_id)
     return tostring(root)
@@ -825,6 +958,21 @@ class Excel365Workbook:
                 worksheet = workbook[sheet_name]
                 loaded_formula_texts: dict[str, str] = {}
                 for coordinate in formula_texts:
+                    snapshot = self._preserved_formula_attributes.get(
+                        sheet_name, {}
+                    ).get(coordinate, {})
+                    if (
+                        not snapshot.get("text")
+                        and snapshot.get("attributes", {}).get("t") in {None, "normal"}
+                    ):
+                        # Excel emits empty <f ca="1"/> on some spill children.
+                        # These are cached outputs, not an executable "=" formula.
+                        cached = snapshot.get("cached_value")
+                        kind = snapshot.get("cell_type")
+                        if cached is not None and kind not in {"str", "e", "s"}:
+                            cached = bool(int(cached)) if kind == "b" else float(cached)
+                        worksheet[coordinate].value = cached
+                        continue
                     value = worksheet[coordinate].value
                     if isinstance(value, ArrayFormula):
                         formula = value.text
@@ -839,11 +987,44 @@ class Excel365Workbook:
                     loaded_formula_texts[coordinate] = normalize_excel365_formula(
                         formula
                     )[0]
+                    snapshot = self._preserved_formula_attributes.get(
+                        sheet_name, {}
+                    ).get(coordinate)
+                    if snapshot is not None:
+                        loaded_text = loaded_formula_texts[coordinate]
+                        snapshot["loaded_text"] = (
+                            loaded_text[1:]
+                            if loaded_text.startswith("=")
+                            else loaded_text
+                        )
                 self._source_formula_texts_by_worksheet_id[id(worksheet)] = (
                     loaded_formula_texts
                 )
+        self._source_array_outputs = {}
+        for sheet_name, snapshots in self._preserved_formula_attributes.items():
+            if sheet_name not in workbook.sheetnames:
+                continue
+            ws = workbook[sheet_name]
+            for coordinate, snapshot in snapshots.items():
+                attributes = snapshot["attributes"]
+                if attributes.get("t") != "array" or not attributes.get("ref"):
+                    continue
+                c1, r1, c2, r2 = range_boundaries(attributes["ref"])
+                if c1 == c2 and r1 == r2:
+                    continue
+                if (c2 - c1 + 1) * (r2 - r1 + 1) <= len(ws._cells):
+                    cells = (ws._cells.get((row, col))
+                             for row in range(r1, r2 + 1)
+                             for col in range(c1, c2 + 1))
+                else:
+                    cells = (cell for cell in ws._cells.values()
+                             if r1 <= cell.row <= r2 and c1 <= cell.column <= c2)
+                children = {cell.coordinate: cell.value for cell in cells
+                            if cell is not None and cell.coordinate != coordinate}
+                self._source_array_outputs[id(ws), coordinate] = children
+
     @classmethod
-    def open(cls, filename: str | os.PathLike[str], **kwargs: Any) -> Excel365Workbook:
+    def open(cls, filename: str | os.PathLike[str], **kwargs: Any) -> "Excel365Workbook":
         path = Path(filename).expanduser().resolve()
         if path.suffix.lower() not in {".xlsx", ".xlsm"}:
             raise ValueError("Excel365Workbook supports .xlsx and .xlsm files")
@@ -861,6 +1042,7 @@ class Excel365Workbook:
 
         package_state = _discover_package_state(path)
         workbook = load_workbook(path, **kwargs)
+        _sync_calculation_properties(path, workbook)
         return cls(
             workbook,
             source_path=path,
@@ -868,7 +1050,7 @@ class Excel365Workbook:
         )
 
     @classmethod
-    def create(cls) -> Excel365Workbook:
+    def create(cls) -> "Excel365Workbook":
         return cls(Workbook())
 
     @property
@@ -876,6 +1058,118 @@ class Excel365Workbook:
         """Short alias for callers already accustomed to an openpyxl workbook."""
 
         return self.workbook
+
+    @staticmethod
+    def _validate_cloud_workbook_url(url: str) -> str:
+        """Validate an explicit workbook URL; never infer an account or path."""
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment
+                or "\\" in url or any(ord(c) < 32 for c in url)):
+            raise ValueError("Use a full HTTPS workbook URL, not a sharing URL or local path")
+        if not parsed.path.lower().endswith((".xlsx", ".xlsm", ".xlsb", ".xls")):
+            raise ValueError("Cloud URL must identify a workbook file")
+        if parsed.hostname.lower() == "d.docs.live.net":
+            if not re.match(r"^/[0-9a-fA-F]{16}/.+", parsed.path):
+                raise ValueError("Personal OneDrive URL requires a verified 16-digit CID")
+            if re.search(r"/(?:Mac/Home|Library/CloudStorage)/", parsed.path, re.I):
+                raise ValueError("OneDrive cloud URL contains a local Mac path")
+        return url
+
+    def external_link_targets(self) -> list[dict[str, Any]]:
+        """Return formula link indices and all saved path alternatives, read-only."""
+        result = []
+        for index, link in enumerate(self.workbook._external_links, 1):
+            part = f"xl/externalLinks/_rels/externalLink{index}.xml.rels"
+            raw = self._preserved_package_parts.get(part)
+            targets = ([r.get("Target") for r in fromstring(raw)
+                        if r.get("Type") == f"{DOCUMENT_REL_NS}/externalLinkPath"]
+                       if raw else [link.file_link.Target])
+            result.append({"index": index, "targets": targets})
+        return result
+
+    def set_external_link_target(self, index: int, source_url: str) -> None:
+        """Relocate the same source workbook to HTTPS, preserving formulas/caches.
+
+        All externalLinkPath alternatives are replaced, including Excel's local
+        fallback paths. This does not refresh data or verify cloud access. Do not
+        use retained caches as evidence that a different source contains them.
+        """
+        source_url = self._validate_cloud_workbook_url(source_url)
+        if isinstance(index, bool) or not isinstance(index, int) or not (
+            1 <= index <= len(self.workbook._external_links)
+        ):
+            raise ValueError("External link index must identify an existing workbook link")
+        link = self.workbook._external_links[index - 1]
+        if link.externalBook is None or link.file_link is None:
+            raise ValueError("Only external workbook links can be relocated")
+        part = f"xl/externalLinks/_rels/externalLink{index}.xml.rels"
+        raw = self._preserved_package_parts.get(part)
+        if raw:
+            root = fromstring(raw)
+            for relationship in root:
+                if relationship.get("Type") == f"{DOCUMENT_REL_NS}/externalLinkPath":
+                    relationship.set("Target", source_url)
+                    relationship.set("TargetMode", "External")
+            self._preserved_package_parts[part] = tostring(root)
+        link.file_link.Target = source_url
+        link.file_link.TargetMode = "External"
+
+    def set_external_reference(
+        self, sheet: str | Any, coordinate: str, *, source_url: str,
+        source_sheet: str, source_cell: str,
+    ) -> int:
+        """Write a single-cell cloud reference and its real OOXML link records.
+
+        Returns the 1-based link index. Reuses a source URL when possible, without
+        guessing OneDrive identities. New formulas have no calculated cache.
+        """
+        source_url = self._validate_cloud_workbook_url(source_url)
+        if not source_sheet or len(source_sheet) > 31 or re.search(r"[\[\]:*?/\\]", source_sheet):
+            raise ValueError("Invalid source worksheet name")
+        if not re.fullmatch(r"\$?[A-Za-z]{1,3}\$?[1-9][0-9]*", source_cell):
+            raise ValueError("source_cell must be one A1-style cell reference")
+        c1, r1, _, _ = range_boundaries(source_cell)
+        if c1 > 16384 or r1 > 1048576:
+            raise ValueError("source_cell exceeds Excel worksheet bounds")
+        worksheet = self.workbook[sheet] if isinstance(sheet, str) else sheet
+        if isinstance(worksheet[coordinate].value, ArrayFormula):
+            raise ValueError("Cannot replace an array anchor with a scalar reference")
+        index = next((item["index"] for item in self.external_link_targets()
+                      if source_url in item["targets"]), None)
+        if index is None:
+            link = ExternalLink(externalBook=ExternalBook(
+                id="rId1", sheetNames=ExternalSheetNames(sheetName=[source_sheet]),
+            ))
+            link.file_link = Relationship(
+                Id="rId1", Type=f"{DOCUMENT_REL_NS}/externalLinkPath",
+                Target=source_url, TargetMode="External",
+            )
+            self.workbook._external_links.append(link)
+            index = len(self.workbook._external_links)
+        else:
+            # Remove a prior local alternative when reusing a verified cloud link.
+            self.set_external_link_target(index, source_url)
+            link = self.workbook._external_links[index - 1]
+            if link.externalBook.sheetNames is None:
+                link.externalBook.sheetNames = ExternalSheetNames()
+            if source_sheet not in link.externalBook.sheetNames.sheetName:
+                link.externalBook.sheetNames.sheetName.append(source_sheet)
+                part = f"xl/externalLinks/externalLink{index}.xml"
+                if part in self._preserved_package_parts:
+                    root = fromstring(self._preserved_package_parts[part])
+                    book = root.find(f"{{{MAIN_NS}}}externalBook")
+                    names = book.find(f"{{{MAIN_NS}}}sheetNames")
+                    if names is None:
+                        names = SubElement(book, f"{{{MAIN_NS}}}sheetNames")
+                        book.remove(names)
+                        book.insert(0, names)
+                    SubElement(names, f"{{{MAIN_NS}}}sheetName", {"val": source_sheet})
+                    self._preserved_package_parts[part] = tostring(root)
+        escaped_sheet = source_sheet.replace("'", "''")
+        worksheet[coordinate] = f"='[{index}]{escaped_sheet}'!{source_cell}"
+        self.invalidate_formula_cache(worksheet, coordinate)
+        return index
 
     def set_dynamic_formula(
         self,
@@ -919,6 +1213,23 @@ class Excel365Workbook:
             source_formula_texts = self._source_formula_texts_by_worksheet_id.get(
                 id(worksheet), {}
             )
+            # Clear only unedited former spill outputs when the source anchor
+            # changes or becomes a scalar. Explicit edits in that area survive.
+            for (ws_id, coordinate), children in self._source_array_outputs.items():
+                if ws_id != id(worksheet):
+                    continue
+                value = worksheet[coordinate].value
+                formula = value.text if isinstance(value, ArrayFormula) else value
+                current = (
+                    normalize_excel365_formula(formula)[0]
+                    if isinstance(formula, str) and formula.startswith("=")
+                    else None
+                )
+                if current == source_formula_texts.get(coordinate):
+                    continue
+                for address, cached in children.items():
+                    if worksheet[address].value == cached:
+                        worksheet[address].value = None
             anchors: set[str] = set()
             spill_outputs_to_clear: set[tuple[int, int]] = set()
             for cell in list(worksheet._cells.values()):
@@ -979,13 +1290,12 @@ class Excel365Workbook:
         self,
         filename: str | os.PathLike[str],
         *,
-        recalculate_on_open: bool = True,
+        recalculate_on_open: bool = False,
     ) -> Path:
-        """Atomically save a workbook with dynamic-array metadata restored.
+        """Atomically save with metadata restored and no calculation chain.
 
-        ``recalculate_on_open=False`` is useful for workbooks containing slow
-        external add-in functions.  A caller can then ask Excel to calculate
-        only the cells that were deliberately changed.
+        Formula evaluation is left to Excel. Set ``recalculate_on_open=True``
+        to explicitly request full calculation when the workbook is opened.
         """
 
         destination = Path(filename).expanduser().resolve()
@@ -993,6 +1303,14 @@ class Excel365Workbook:
             raise ValueError("Output must use the .xlsx or .xlsm extension")
         destination.parent.mkdir(parents=True, exist_ok=True)
 
+        # Include rich-text-only sheets in package patching, even without
+        # formulas or metadata, so new workbooks receive the same fix.
+        for worksheet in self.workbook.worksheets:
+            if any(
+                isinstance(cell.value, CellRichText)
+                for cell in worksheet._cells.values()
+            ):
+                self._preserved_cell_attributes.setdefault(worksheet.title, {})
         dynamic_cells = self._prepare_formulas()
         invalidated_formula_caches = {
             worksheet.title: set(
@@ -1018,19 +1336,26 @@ class Excel365Workbook:
         dynamic_metadata_index = min(
             dynamic_metadata_indices or {"1"}, key=int
         )
+        # Leave Excel defaults implicit: automatic mode, no forced full calc.
         calculation = self.workbook.calculation
-        calculation.calcMode = "auto"
-        calculation.fullCalcOnLoad = recalculate_on_open
-        calculation.forceFullCalc = recalculate_on_open
+        if calculation is None:
+            calculation = self.workbook.calculation = CalcProperties()
+        calculation.calcMode = None
+        calculation.fullCalcOnLoad = True if recalculate_on_open else None
+        calculation.forceFullCalc = None
 
+        # Stage outside the destination directory: OneDrive registers any
+        # short-lived sibling temp file and then retries it forever once it
+        # is renamed away (ghost "itemNotFound" downloads).
+        staging_dir = _staging_dir()
         stage_fd, stage_name = tempfile.mkstemp(
-            dir=destination.parent,
-            prefix=f".{destination.stem}.openpyxl-",
+            dir=staging_dir,
+            prefix=f"{destination.stem}.openpyxl-",
             suffix=destination.suffix,
         )
         output_fd, output_name = tempfile.mkstemp(
-            dir=destination.parent,
-            prefix=f".{destination.stem}.excel365-",
+            dir=staging_dir,
+            prefix=f"{destination.stem}.excel365-",
             suffix=destination.suffix,
         )
         os.close(stage_fd)
@@ -1043,6 +1368,8 @@ class Excel365Workbook:
             if (
                 metadata_xml is not None
                 or self._preserved_package_parts
+                or self._preserved_cell_attributes
+                or self._preserved_formula_attributes
                 or self._extended_data_validations
                 or self._threaded_comment_state.get("worksheets")
             ):
@@ -1068,13 +1395,56 @@ class Excel365Workbook:
                 )
             else:
                 os.replace(stage_path, output_path)
-            os.replace(output_path, destination)
+            _publish(output_path, destination)
         finally:
             stage_path.unlink(missing_ok=True)
             output_path.unlink(missing_ok=True)
 
         self.source_path = destination
         return destination
+
+
+def _staging_dir() -> Path:
+    """Local (non-synced) directory for save-time temp files.
+
+    Override with ``EXCEL365_STAGING_DIR``; defaults to ``~/Library/Caches``
+    on macOS and the system temp directory elsewhere.
+    """
+
+    override = os.environ.get("EXCEL365_STAGING_DIR")
+    if override:
+        base = Path(override).expanduser()
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches" / "excel365"
+    else:
+        base = Path(tempfile.gettempdir()) / "excel365"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _publish(source: Path, destination: Path) -> None:
+    """Move the finished workbook into place without leaving a sibling temp file.
+
+    Same-volume moves are a single atomic rename.  Across volumes, copy to a
+    ``.tmp`` sibling and rename that.
+    """
+
+    try:
+        os.replace(source, destination)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+    sibling_fd, sibling_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f"~{destination.stem}.", suffix=".tmp"
+    )
+    os.close(sibling_fd)
+    sibling = Path(sibling_name)
+    try:
+        shutil.copyfile(source, sibling)
+        os.replace(sibling, destination)
+    finally:
+        sibling.unlink(missing_ok=True)
 
 
 def inspect_excel365_dynamic_arrays(
